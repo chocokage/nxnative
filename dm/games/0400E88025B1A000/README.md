@@ -27,7 +27,7 @@ There is no game-specific patch, and only v131072's build row: the base game, v0
 
 ## The picture
 
-Every 3D target is 768x432 from the first frame of the title to the tutorial: MetalFX stands in for DLSS at 768x432 to 768x432, the game's NDSR compute networks take that to 1536x864, and the result reaches the 3840x2160 swap chain, whose top-left 1920x1080 holds the picture. The game's own defaults give the reason for the figure, not the cause: `render.dynres_min_scale_x` is 0.5 and `max` 1.0, so 768x432 is the minimum of a 1536x864 base, at 6 to 11 ms of GPU time a frame on the M4 Pro. `gpu_timestamps segment` changes nothing. Whether a console stays there too is not known.
+Every 3D target is 768x432 from the first frame of the title to the tutorial: MetalFX stands in for DLSS at 768x432 to 768x432, the game's NDSR compute networks take that to 1536x864, and the result reaches the 3840x2160 swap chain, whose top-left 1920x1080 holds the picture. This is the game's own Switch 2 setting, not a host answer (resolved). Its render config in `data.zip` (member `a513f6ee3dbafec6`, a JSON of cvars) sets `render.resolution_scale_console` to 0.8333 by default and 0.5 for `"platform": "switch2"`, with `render.main_upscaler_console` 3 on the Switch 2 and `render.ndsr_disables_dynres` true. Probes on the Mac show the same values. At `main+0xb44984c`, `render.resolution_scale` reads 1.0. At `main+0xb4498b0`, the console override reads 0.5, with console mode (1) at `[sp+0x2c0]`. The scale stored at `main+0xb449980` is 0.5, followed by 1536x864. The dynamic-resolution state (`main+0xb45b060`, the renderer at `+0x451d40`) holds scale 1.0 on both axes, its thermal limit (`render.dynres_thermal_state`, table 1.0 / 0.9 / 0.75 / 0.5) off. `gpu_timestamps segment` changes nothing, as expected. A console in docked mode renders the same 768x432.
 
 ## Driving it on the Mac
 
@@ -47,7 +47,6 @@ Every 3D target is 768x432 from the first frame of the title to the tutorial: Me
 
 ## Open
 
-- [The picture](#the-picture): why the 3D stays at 768x432.
 - `[RED] DLSS: the game's bias mask (a reactive mask for MetalFX) is not passed on`.
 - The game's wake-up eventfd fails (the host refuses `nn::socket::EventFd`), so its HTTP thread polls without a wake-up; harmless offline.
 - A `pso_manifest.tsv` has not been recorded; `render_cond` not tried; the later levels and combat, and iOS, not tested.
