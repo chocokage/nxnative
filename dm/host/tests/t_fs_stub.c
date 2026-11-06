@@ -17,5 +17,9 @@ int dm_game_imports(const char *prefix) { (void)prefix; return 0; }
 int dm_mii_standin(const char *dir) { (void)dir; return 0; }
 // the guest scheduler (hle_thread.c): no guest threads, so no handoff to leave
 void dm_thread_service_request(void) {}
-// DM_RECORD's copy of the mounted save (hle_session.c): no session in a unit test
-void dm_session_save(const char *dir) { (void)dir; }
+// the input journal (hle_journal.c): no recording in a unit test
+void dm_journal_save_opened(const char *dir) { (void)dir; }
+void dm_journal_save_read(const char *dir, const char *file, int64_t off, int64_t size, int64_t file_size) { (void)dir; (void)file; (void)off; (void)size; (void)file_size; }
+void dm_journal_save_committed(const char *dir) { (void)dir; }
+int dm_journal_active(void) { return 0; }
+int dm_journal_save_swapped(void) { return 0; }

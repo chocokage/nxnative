@@ -4,6 +4,7 @@
 #include <mach-o/getsect.h>
 
 uint64_t guest_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+int dm_journal_boot_time(int64_t *out) { (void)out; return 0; }   // the input journal (hle_journal.c): not recording in a unit test
 static int checks, fails;
 extern const struct mach_header_64 _mh_execute_header;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)

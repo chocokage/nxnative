@@ -3,6 +3,8 @@
 #include <pthread.h>
 #include "hle.h"
 #include <mach/mach_time.h>
+#include <os/lock.h>
+#include "journal.h"
 #include <stdatomic.h>
 
 // ---------- Side table ----------
@@ -53,7 +55,41 @@ static int detclock_cfg(void) {
     return c;
 }
 static uint64_t wall_guest_ns(void) { return atomic_load(&g_gfz) ? atomic_load(&g_gfrozen) : now_ns() - atomic_load(&g_glag); }
-uint64_t guest_ns(void) { return atomic_load(&g_gdet_on) ? atomic_load(&g_gdet) : wall_guest_ns(); }
+// Input journal (hle_journal.c): the guest clock starts at 0 when the run begins, as on a freshly booted console (the host's uptime differs by minutes between
+// a recording and its replay, and games seed random choices from the counter); every guest_ns reader takes differences of it or compares it with itself
+void dm_guest_clock_rebase(void) { atomic_store(&g_glag, now_ns()); }
+// The frame clock (input journal, DM_INPUT_JOURNAL_FRAME_CLOCK=1): guest time advances by the frame's period at each present, in whole milliseconds inside a
+// frame and stopping a millisecond short of the next one, so a frame lasts the same guest time in a recording and its replay whatever the host's frame
+// times. Two periods without a present (a loading screen, a stall) and it runs freely, so a thread polling the clock cannot hang. Eden's AdvanceFrameClock
+// and GetGuestClockTicks (docs/nx2 §7.1) in nanoseconds; frozen time (background, keyboard) does not count, as on the wall clock
+static os_unfair_lock g_fc_lock = OS_UNFAIR_LOCK_INIT; static _Atomic int g_fc_on; static uint64_t g_fc_base, g_fc_last, g_fc_wall, g_fc_period;
+static _Atomic uint64_t g_frame_period;
+void dm_guest_frame_period(uint64_t ns) { atomic_store(&g_frame_period, ns); }
+uint64_t dm_guest_frame_period_ns(void) { return atomic_load(&g_frame_period); }
+void dm_frame_clock_advance(uint64_t period_ns) {
+    os_unfair_lock_lock(&g_fc_lock);
+    uint64_t wall = wall_guest_ns();
+    if (!atomic_load(&g_fc_on)) {
+        const uint64_t fixed = 10000000000ull;   // the first frame at exactly 10 s
+        if (wall > fixed) LOG("frame clock: the first frame came %.1f s after boot, later than the 10 s it is pinned to", wall / 1e9);
+        g_fc_base = wall > g_fc_last ? wall : g_fc_last; if (g_fc_base < fixed) g_fc_base = fixed;
+        atomic_store(&g_fc_on, 1);
+    } else { uint64_t a = g_fc_base + g_fc_period, b = g_fc_last + 1; g_fc_base = a > b ? a : b; }
+    if (g_fc_base > g_fc_last) g_fc_last = g_fc_base;
+    g_fc_wall = wall; g_fc_period = period_ns;
+    os_unfair_lock_unlock(&g_fc_lock);
+}
+static uint64_t frame_clock_ns(void) {
+    os_unfair_lock_lock(&g_fc_lock);
+    uint64_t wall = wall_guest_ns(), since = wall > g_fc_wall ? wall - g_fc_wall : 0, q = 1000000;
+    uint64_t cap = g_fc_period > q ? g_fc_period - q : 0, grace = 2 * g_fc_period, off;
+    if (since < grace) { off = since / q * q; if (off > cap) off = cap; } else off = cap + since - grace;
+    if (g_fc_base + off > g_fc_last) g_fc_last = g_fc_base + off;
+    uint64_t r = g_fc_last;
+    os_unfair_lock_unlock(&g_fc_lock);
+    return r;
+}
+uint64_t guest_ns(void) { return atomic_load(&g_gdet_on) ? atomic_load(&g_gdet) : atomic_load_explicit(&g_fc_on, memory_order_relaxed) ? frame_clock_ns() : wall_guest_ns(); }
 // The system counter on that clock: 19.2 MHz on the Switch, 31.25 MHz (32 ns a tick) on the Switch 2, whose SDK reads cntpct_el0 and converts with that rate
 // (nn::os::GetSystemTickFrequency answers 0x1dcd650, sdk 20.5.19 Ounce). Read at 19.2 MHz, every tick span a Switch 2 game measured came out 1.63 times too short, and the
 // same clock's GPU timestamps 1.63 times too late: Donkey Kong Bananza's frame-rate controller took its frame for seconds long and held it at 20 fps (present interval 3)
@@ -62,6 +98,7 @@ int dm_detclock_enabled(void) { return detclock_cfg() && atomic_load(&g_gdet_on)
 void dm_guest_frame_tick(void) {
     crash_watch_frame();
     atomic_fetch_add(&g_guest_frame, 1);
+    dm_journal_frame();   // the input journal's frame: records player 1's input or gives the game the recorded one, before the next frame reads it
     if (!detclock_cfg()) return;
     if (!atomic_load(&g_gdet_on)) {
         atomic_store(&g_gdet, wall_guest_ns()); atomic_store(&g_gdet_on, 1);
@@ -98,16 +135,19 @@ void guest_clock_freeze_for(int reason, int on) {
 void guest_clock_freeze(int on) { guest_clock_freeze_for(0, on); }
 // Entropy source: true random by default (arc4random); with DM_DETCLOCK on it becomes a fixed-seed splitmix64 stream (so that replay pictures are byte-for-byte comparable, the camp blue fire particles differed between two passes).
 // The two outlets (libc getentropy, svc GetInfo RandomEntropy) share one stream; the call count is reported in the log (first call and every 1000 calls)
-static _Atomic uint64_t g_detrng = 0x5357444554524e47ull; static _Atomic uint64_t g_detrng_n;
+// The input journal pins the stream to its run's seed (dm_entropy_seed), so random choices repeat in a replay; DM_DETCLOCK keeps its own
+static _Atomic uint64_t g_detrng = 0x5357444554524e47ull; static _Atomic uint64_t g_detrng_n; static _Atomic int g_seeded;
+void dm_entropy_seed(uint32_t seed) { atomic_store(&g_detrng, 0x5357444554524e47ull ^ seed); atomic_store(&g_seeded, 1); }
+static int entropy_det(void) { return detclock_cfg() || atomic_load_explicit(&g_seeded, memory_order_relaxed); }
 uint64_t dm_entropy64(void) {
-    if (!detclock_cfg()) return ((uint64_t)arc4random() << 32) | arc4random();
+    if (!entropy_det()) return ((uint64_t)arc4random() << 32) | arc4random();
     uint64_t z = atomic_fetch_add(&g_detrng, 0x9E3779B97F4A7C15ull) + 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
-    uint64_t n = atomic_fetch_add(&g_detrng_n, 1) + 1; if (n == 1 || n % 1000 == 0) LOG("DM_DETCLOCK: deterministic entropy call %llu", (unsigned long long)n);
+    uint64_t n = atomic_fetch_add(&g_detrng_n, 1) + 1; if (n == 1 || n % 1000 == 0) LOG("deterministic entropy (DM_DETCLOCK or the input journal's seed): call %llu", (unsigned long long)n);
     return z;
 }
 HLE("getentropy", int, g_getentropy, void *p, size_t n) {
-    if (!detclock_cfg()) { arc4random_buf(p, n); return 0; }
+    if (!entropy_det()) { arc4random_buf(p, n); return 0; }
     for (size_t i = 0; i < n; i += 8) { uint64_t v = dm_entropy64(); memcpy((uint8_t *)p + i, &v, n - i < 8 ? n - i : 8); }
     return 0;
 }

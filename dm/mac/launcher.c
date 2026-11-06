@@ -225,7 +225,11 @@ int main(int argc, char **argv) {
     while (waitpid(g_child, &status, 0) < 0) if (errno != EINTR) return 1;
     // Cloud saves (DM_SAVE_SYNC, dm/host/save_sync.h): what the host committed and had not sent yet goes now, after a crash too (the committed save is whole whatever the host was doing)
     // DM_SAVE as the host had it: an env file or the launch environment may have set another folder than this app's own
-    if (!save_sync_after_exit(getenv("DM_SAVE"), id)) fprintf(stderr, "launcher: the save did not reach the cloud; it goes at the next start\n");
+    // Not while a replay's save is still in place of the user's (the input journal's marker, dm/host/hle_journal.c): the next start puts the user's back first
+    char mk[1024]; const char *rr = getenv("DM_REPLAY_ROOT"), *home = getenv("HOME");
+    if (rr && *rr) snprintf(mk, sizeof mk, "%s/pending_save_restore.txt", rr); else snprintf(mk, sizeof mk, "%s/Library/Logs/nxnative/replay/pending_save_restore.txt", home ? home : "");
+    if (!stat(mk, &st)) fprintf(stderr, "launcher: a replay's save is still in place of yours (%s); no cloud upload until the next start puts yours back\n", mk);
+    else if (!save_sync_after_exit(getenv("DM_SAVE"), id)) fprintf(stderr, "launcher: the save did not reach the cloud; it goes at the next start\n");
     if (WIFSIGNALED(status)) { fprintf(stderr, "launcher: the host stopped on signal %d\n", WTERMSIG(status)); return 128 + WTERMSIG(status); }
     fprintf(stderr, "launcher: the host exited with %d\n", WEXITSTATUS(status));
     return WEXITSTATUS(status);

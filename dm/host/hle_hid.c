@@ -16,6 +16,8 @@
 #include <time.h>
 #include <math.h>
 #include "motion_fusion.h"
+#include "journal.h"
+#include <os/lock.h>
 
 enum { NPAD_NO1 = 0, NPAD_HANDHELD = 0x20 };
 enum { STYLE_FULLKEY = 1u << 0, STYLE_HANDHELD = 1u << 1, STYLE_JOYDUAL = 1u << 2, STYLE_JOYLEFT = 1u << 3, STYLE_JOYRIGHT = 1u << 4 };
@@ -33,6 +35,7 @@ _Static_assert(sizeof(NpadState) == 0x28, "NpadState");
 // the separate paths also keep scripted input out of DM_REC, which records the physical ones (rec_read)
 static _Atomic uint64_t g_btn, g_axes, g_latch, g_sc_btn, g_sc_axes, g_sc_latch, g_pad_btn[DM_PLAYERS], g_pad_axes[DM_PLAYERS], g_pad_latch[DM_PLAYERS];
 static _Atomic uint64_t g_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
+static _Atomic uint64_t g_jl_btn, g_jl_sc, g_jl_pad[DM_PLAYERS];   // presses since the input journal's last sample (dm_hid_live_sample), so a press shorter than a frame is recorded
 static _Atomic int g_hold;              // an applet holds the input (dm_input_hold)
 static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
@@ -52,12 +55,12 @@ static void shake_note(void) {
     else { uint64_t t0 = atomic_load(&g_shake_t0); atomic_store(&g_shake_end, t0 + ((t - t0) / SHAKE_CYCLE_NS + 1) * SHAKE_CYCLE_NS); }
 }
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
-    uint64_t old = atomic_exchange(&g_btn, buttons); atomic_fetch_or(&g_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_axes, pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_btn, buttons); atomic_fetch_or(&g_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_fetch_or(&g_jl_btn, buttons & ~old); atomic_store(&g_axes, pack(lx, ly, rx, ry));
     shake_note();
 }
 void dm_pad_set_player(int p, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     if (p < 0 || p >= DM_PLAYERS) return;
-    uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_fetch_or(&g_jl_pad[p], buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
     if (!p) shake_note();
 }
 static int32_t pick(int32_t a, int32_t b);
@@ -74,7 +77,7 @@ void dm_input_peek(uint64_t *buttons, int32_t axes[4]) {
 }
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { dm_pad_set_player(0, buttons, lx, ly, rx, ry); }
 static void script_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
-    uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_fetch_or(&g_jl_sc, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
     shake_note();
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
@@ -427,6 +430,24 @@ static void rec_start(void) {
     LOG("DM_REC: recording player 1's input to %s as DM_KEYS steps in presented frames", e);
 }
 
+// The input journal (hle_journal.c, journal.h): player 1's live input as fill composes it (keyboard / touch, the scripted path, its controller and the
+// players merged into it), sampled once per present, and the input player 1's npads are given instead while it records (the sample, latched for the
+// coming frame) or replays. Only player 1, as recorded: further players stay live, so a second player can still play along
+static os_unfair_lock g_ov_lock = OS_UNFAIR_LOCK_INIT; static _Atomic int g_ov_on; static uint64_t g_ov_btn; static int32_t g_ov_axes[4];
+void dm_hid_override(int on, uint64_t buttons, const int32_t axes[4]) {
+    os_unfair_lock_lock(&g_ov_lock); g_ov_btn = buttons; memcpy(g_ov_axes, axes, sizeof g_ov_axes); atomic_store(&g_ov_on, on); os_unfair_lock_unlock(&g_ov_lock);
+}
+void dm_hid_live_sample(uint64_t *buttons, int32_t a[4]) {
+    uint32_t src = 1u | merged_players();
+    uint64_t b = atomic_load(&g_btn) | atomic_exchange(&g_jl_btn, 0) | atomic_load(&g_sc_btn) | atomic_exchange(&g_jl_sc, 0);
+    uint64_t k = atomic_load(&g_axes), c = atomic_load(&g_sc_axes);
+    for (int i = 0; i < 4; i++) a[i] = pick(ax(k, i), ax(c, i));
+    for (int p = 0; p < DM_PLAYERS; p++) if (src >> p & 1) {
+        b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_jl_pad[p], 0);
+        uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
+    }
+    *buttons = b & 0xffffull;
+}
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
@@ -448,6 +469,9 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         if (atomic_load_explicit(&g_rec_on, memory_order_relaxed)) rec_read((b & 0xffffull) | ((atomic_load(&g_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE), a);
         b |= atomic_load(&g_sc_btn) | atomic_exchange(&g_sc_latch, 0);
         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
+    }
+    if (!pl && atomic_load_explicit(&g_ov_on, memory_order_acquire)) {   // the input journal's input (the latches above were taken all the same)
+        os_unfair_lock_lock(&g_ov_lock); if (atomic_load(&g_ov_on)) { b = g_ov_btn; memcpy(a, g_ov_axes, sizeof a); } os_unfair_lock_unlock(&g_ov_lock);
     }
     if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];

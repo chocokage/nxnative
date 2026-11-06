@@ -1,4 +1,5 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
+#include "journal.h"
 #include "dm.h"
 #include "front.h"
 #include "../gfx/nvn/dmsh_chain.h"
@@ -101,6 +102,7 @@ static void *keyrace_thread(void *unused);
 static void host_preload(int argc, char **argv) {
     g_t0_ns = proc_start_mono_ns();
     flags_init();
+    dm_journal_init();   // the input journal's seed, boot date and guest clock, before anything reads them (hle_journal.c)
     if (argc < 2) die("usage: dmhost <dir> [mod...] [-- game arguments...]");
     // Time zone: the game converts absolute time to local time along two paths, both ending in the host libc -- nn::time::ToCalendarTime (hle_time.c, localtime_r) and the guest libc's
     // localtime_r / mktime (hle_table.c wires them straight to the host). So only when the host follows the system time zone do the original game's screens (chronicle discovery time etc.) show this machine's time.
@@ -142,7 +144,7 @@ static void host_preload(int argc, char **argv) {
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
-    { void dm_session_start(int argc, char **argv); dm_session_start(argc, argv); }   // DM_RECORD: this run as a session to play again; sets DM_REC before the keys start (hle_session.c)
+    dm_journal_start();   // the input journal: records this run, or replays one (DM_REPLAY), before the game mounts its save (hle_journal.c)
     hid_keys_init();   // DM_KEYS scripted input
     uint64_t tb = now_ns();
     stubs_report();

@@ -4,6 +4,7 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+#include "journal.h"
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
@@ -15,16 +16,24 @@ static int64_t fixed_time(void) {
                    if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v); }
     return v;
 }
+// The input journal (hle_journal.c) pins the boot date while recording or replaying: the user clock reads the recording's boot date plus the guest clock,
+// and the steady clock is the guest clock, so a replay sees the same date and time as its recording. DM_FIXED_TIME still wins
+static int pinned_ns(int64_t *ns) {
+    int64_t boot; if (!dm_journal_boot_time(&boot)) return 0;
+    *ns = boot * 1000000000ll + (int64_t)guest_ns(); return 1;
+}
+static int64_t user_now(void) { int64_t ft = fixed_time(), ns; return ft >= 0 ? ft : pinned_ns(&ns) ? ns / 1000000000ll : time(NULL); }
+static uint64_t steady_ns(void) { int64_t b; return dm_journal_boot_time(&b) ? guest_ns() : clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
 // Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
 HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
-    int64_t s = (int64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000ull);
+    int64_t s = (int64_t)(steady_ns() / 1000000000ull);
     memcpy(out, &s, 8); memcpy(out + 8, "dmhost-steady-01", 16); return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "user clock → host time()", Result, h_time_GetCurrentTime, int64_t *out) {
-    int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL); return RES_OK;
+    *out = user_now(); return RES_OK;
 }
 // The adjustable user clock (Animal Crossing: New Horizons 3.0.3, whose days follow it): the SDK keeps it in a MonotonicSystemClock that Adjust sets from the user clock's context, and its
 // GetCurrentTime reads the time service's shared memory, which the host never maps (an abort in MonotonicSystemClock::GetCurrentTime, sdk+0x4421cc on that build). On the host the user clock
@@ -36,6 +45,7 @@ HLE_FORCE("_ZN2nn4time25AdjustableUserSystemClock14GetCurrentTimeEPNS0_9PosixTim
 static int h_time_timespec(int64_t *ts) {
     int64_t ft = fixed_time();
     if (ft >= 0) { ts[0] = ft; ts[1] = 0; return 0; }
+    int64_t ns; if (pinned_ns(&ns)) { ts[0] = ns / 1000000000ll; ts[1] = ns % 1000000000ll; return 0; }
     struct timespec t; clock_gettime(CLOCK_REALTIME, &t); ts[0] = t.tv_sec; ts[1] = t.tv_nsec; return 0;
 }
 HLE_FORCE("_ZN2nn4time41GetStandardUserSystemClockCurrentTimespecEP8timespec", "C library real-time clock from the user clock → host real time", int, h_time_StdTimespec, int64_t *ts) { return h_time_timespec(ts); }
@@ -44,7 +54,7 @@ HLE_FORCE("_ZN2nn4time43GetAdjustableUserSystemClockCurrentTimespecEP8timespec",
 // shared memory, which the host never maps. Unbound, the call fails and std::chrono::steady_clock::now() throws std::system_error: Well Dweller reached that at its first frame timer read (sdk+0x5f2e58
 // → std::terminate). The host's monotonic clock is the steady clock here, so clock_gettime and the steadiness agree
 static int h_time_mono_timespec(int64_t *ts) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); ts[0] = t.tv_sec; ts[1] = t.tv_nsec; return 0;
+    uint64_t ns = steady_ns(); ts[0] = (int64_t)(ns / 1000000000ull); ts[1] = (int64_t)(ns % 1000000000ull); return 0;
 }
 HLE_FORCE("_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec", "C library monotonic clock from the steady clock → host monotonic time", int, h_time_MonoTimespec, int64_t *ts) { return h_time_mono_timespec(ts); }
 // User clock context (0x20 bytes: s64 offset + the steady time point it was made at; user time = offset + a steady time point of the same source ID, the snapshot below fills its +0x00 the same way).
@@ -67,7 +77,7 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time()", int64_t, h_time_now, void) {
-    int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
+    return user_now(); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time_pointINS0_17SystemClockTraitsENS3_8durationIlNS2_5ratioILl1ELl1EEEEEEE",
           "the SDK implementation pairs with now(), taken over with it", int64_t, h_time_to_time_t, const int64_t *tp) { return *tp; }
 HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
