@@ -1,5 +1,5 @@
 """NSP script: the free-space check's estimate of the extraction (extract_bytes). Two NSPs of the same size both count (the sizes were once collected in a set, PR #277);
-with clones the base game counts once, without them once per version. No game files, keys or Xcode needed (temporary files only)."""
+with clones the base game counts once, without them once per version. --delete-packages: the package files it deletes after the extraction. No game files, keys or Xcode needed (temporary files only)."""
 import importlib.util
 from pathlib import Path
 import shutil
@@ -35,6 +35,12 @@ class Space(unittest.TestCase):
     def test_no_clone_source_without_v0(self):   # clones need the base game extracted alone first
         base, u1, u2 = self.nsp('base.nsp', 100), self.nsp('u1.nsp', 5), self.nsp('u2.nsp', 6)
         self.assertEqual(nsp.extract_bytes({'v1': (base, u1), 'v2': (base, u2)}, True), 211)
+
+    def test_delete_packages_lists_a_merged_package_once(self):
+        base, upd = self.nsp('base.nsp', 1), self.nsp('update.nsp', 1)
+        fam = {'base': base, 'updates': [(65536, upd)], 'dlc': [(1, 0, base)]}   # the DLC in the base game's merged package
+        self.assertEqual(nsp.package_paths(fam), [base, upd])
+        self.assertTrue(nsp.parse_args(['--delete-packages']).delete_packages); self.assertFalse(nsp.parse_args([]).delete_packages)
 
 
 if __name__ == '__main__':

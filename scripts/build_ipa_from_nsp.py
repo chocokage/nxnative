@@ -641,6 +641,10 @@ def nsz_source(p, tmp):
     return lower.resolve()
 
 
+def package_paths(fam):   # every package file of a game's family: a merged package once
+    return list(dict.fromkeys([fam['base'], *(p for _, p in fam['updates']), *(p for _, _, p in fam['dlc'])]))
+
+
 def decompress_nsz(nsp_dir, app, fam, keys, env, work=None):
     """NSZ / XCZ files of fam converted once with nsz -D into <build folder>/nsp/ (work, the --work-dir folder, else <title ID>_build in the NSP folder); returns fam with the converted files in their place. nsz writes into an empty temporary folder
     and the file is moved into nsp/ only when nsz exits 0, so a partial one is never taken for a whole one; a conversion is reused while its source has the same name, size and
@@ -2787,6 +2791,7 @@ def parse_args(argv):
     ap.add_argument('--xcode-workspace', help='workspace collecting prepared games (default: NxNative.xcworkspace beside the NSP folder; use with --prepare-xcode)')
     ap.add_argument('-l', '--language', help='game language, a code or a name: ja, fr, de, es, it, nl, pt, ru, ko, zh-Hans, zh-Hant, en-GB, fr-CA, es-419, pt-BR, Japanese, ... (default: the LANGUAGE setting, else English); '
                     'it must be one the game supports, which the console lists')
+    ap.add_argument('--delete-packages', action='store_true', help='delete the game\'s package files (the NUP, or the NSP / NSZ / XCI / XCZ files read, and their NSZ conversions) once everything is extracted, for room on a small disk; the next build needs them again (not for a dump folder)')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
     ap.add_argument('--work-dir', help='the game\'s build folder, used as it is (default: the WORK_DIR setting, else <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA or Mac app defaults to the folder holding it')
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
@@ -2931,6 +2936,8 @@ def main(args=None):
     if want and not re.fullmatch(r'[0-9A-Fa-f]{16}', want): raise BuildError(f'--title-id / TITLE_ID takes a title ID, 16 hex digits: {want}')
     if PROGRAM_INDEX and dump: raise BuildError('--program / PROGRAM_INDEX picks a program from a multi-program application\'s NSPs; '
                                                      + ('a NUP' if nup else 'a dump folder') + ' is read as one program\'s files')
+    if args.delete_packages and dump == 'folder': raise BuildError('--delete-packages is for a NUP or package files, not a dump folder')
+    packages = [nup] if nup else []
     if nup:
         app, fam = scan_nup(nup, int(want, 16) if want else None)
         say(f'a NUP: {nup.name}, {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
@@ -2944,6 +2951,7 @@ def main(args=None):
             from_package.check_keys(fam)
         if PROGRAM_INDEX:   # one program of a multi-program application, packed as a game of its own: its title ID names the profile and the build folder
             app += PROGRAM_INDEX; say(f'program {PROGRAM_INDEX} of the application: title ID {app:016X}')
+        packages = package_paths(fam)   # the files as found, before NSZ / XCZ conversion (--delete-packages)
         fam = decompress_nsz(nsp_dir, app, fam, keys, env, work_dir(args))
     force =args.provisional or PROVISIONAL   # a provisional profile even when dm/games has one (testing the guesses)
     g, provisional, shadowed = None if force else gamemod.by_title(app), False, False
@@ -3060,6 +3068,10 @@ def main(args=None):
         if on: say(src[k][1])
     PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
     aoc = extract_aoc(nx, keys, repo, work, app, fam, logs)
+    if args.delete_packages:   # nothing after the extraction reads them: their room goes to the shaders and the app
+        packages = list(dict.fromkeys([*packages, *([] if nup else package_paths(fam))]))
+        for p in packages: p.unlink(missing_ok=True)
+        say(f'deleted the game\'s package files (--delete-packages): {", ".join(p.name for p in packages)}')
     dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
     base = next((dirs[v] for v in versions if picks[v][1] is None), dirs[versions[0]])   # the folder the base game was extracted to alone
     # the app name and bundle ID both come from the base NSP: the game name in its control data, and a bundle ID from its title ID; a setting / the command line overrides them
