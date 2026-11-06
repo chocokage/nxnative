@@ -3537,7 +3537,7 @@ static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d)
     res_add(mt); g_pool_heap_tex++;
     size_t g0 = at / POOL_HEAP_GRAIN, g1 = MIN((at + need.size - 1) / POOL_HEAP_GRAIN, h->ngrain - 1); int all_new = 1;
     for (size_t g = g0; g <= g1; g++) { if (h->used[g]) all_new = 0; h->used[g] = 1; }
-    if (all_new && !tex_init_fill(t, mt)) tex_zero_fill(mt);
+    if (all_new && !tex_init_fill(t, mt, 0)) tex_zero_fill(mt);
     return mt;
 }
 static id<MTLTexture> tex_mtl_(const tex_t *ct) {
