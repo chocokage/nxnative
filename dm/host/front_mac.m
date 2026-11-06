@@ -5,7 +5,10 @@
 // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
 // Window" (⌘⇧C, or DM_CHEATS_WINDOW=1 at launch) opens a Cheats panel beside the game: sections, search, the master switch,
 // safe mode, values, details and the import of cheat files (see the code below).
-// Key map (Nintendo layout): WASD left stick, arrow keys D-pad (with Shift held: the right stick, for the camera), J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Key map (Nintendo layout, the default of controls.h): WASD left stick, arrow keys D-pad (with Shift held: the right stick, for the camera), J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR,
+// F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller. Keys and controller buttons can be remapped with a controls file (controls.h; NX Play writes it),
+// and Window › Show Controls (⌘/) shows the controls of the input in use: the keyboard's keys, or the buttons of the controller used last.
+// The title bar shows the frame rate of the frames that reached the screen in the last second (Window › Show Frame Rate in Title; DM_TITLE_FPS=0 starts with it off).
 // Controllers: face buttons as on the iPhone, by position (right A, bottom B, top X, left Y) or on a Nintendo pad by its labels (pad_apple.h), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
@@ -25,14 +28,18 @@
 #include "pad_hid_mac.h"
 #include "home_quit.h"
 #include "home_quit_mac.h"
+#include "controls.h"
 #include <signal.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
-static uint64_t g_btn;
-static int g_w, g_a, g_s, g_d;
-static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
+static dm_controls g_ctl;   // the keys' and controller buttons' controls (controls.h): read at start and whenever the game window becomes key (controls_load)
+static int g_held_ctl[DMC_COUNT];   // keys holding each control down (two keys may give the same one)
+static int8_t g_key_down[DMC_KEYS];   // the control each key pressed now holds (-1: none): a D-pad key pressed with Shift held stays the right stick until it goes up,
+                                      // and a release lets go of what the press took even if Shift or the mapping changed in between
+static void controls_source(id src);   // the input used last (nil: the keyboard, a GCController, or an NSString naming a raw HID pad), for the Controls panel
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
@@ -122,19 +129,40 @@ static void cursor_hide_for_input(void) {
     if (NSPointInRect([v convertPoint:g_win.mouseLocationOutsideOfEventStream fromView:nil], v.bounds)) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 static void push(void) {
-    int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
-    dm_input_set(g_btn, lx, ly, rx, ry);
+    #define H(k) (g_held_ctl[k] > 0)
+    int32_t lx = (H(DMC_LS_RIGHT) - H(DMC_LS_LEFT)) * 32767, ly = (H(DMC_LS_UP) - H(DMC_LS_DOWN)) * 32767;
+    int32_t rx = (H(DMC_RS_RIGHT) - H(DMC_RS_LEFT)) * 32767, ry = (H(DMC_RS_UP) - H(DMC_RS_DOWN)) * 32767;
+    uint64_t m = H(DMC_SHAKE) ? DM_BTN_SHAKE : 0;
+    for (int i = 0; i < DMC_BUTTONS; i++) if (H(i)) m |= 1ull << i;
+    #undef H
+    dm_input_set(m, lx, ly, rx, ry);
 }
-static int key_bit(unsigned short code) {
-    switch (code) {
-        case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
-        case 3: return 4;   case 5: return 5;                                            // F G → press stick
-        case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
-        case 36: return 10; case 48: return 11;                                          // Return Tab → + −
-        case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
+static void keys_release(void) { memset(g_held_ctl, 0, sizeof g_held_ctl); memset(g_key_down, -1, sizeof g_key_down); push(); }
+static void controls_panel_refresh(void);
+// The controls file (controls.h): DM_CONTROLS, else controls.tsv in the game's folder (DM_ROOT, the launcher's ~/Library/Application Support/nxnative/<title ID>, or that folder
+// for the profile's title ID when a build is played outside its Mac app), else the one in ~/Library/Application Support/nxnative for every game; none: the defaults. Read at start and whenever the game window becomes key, so NX Play's changes apply on return
+static void controls_load(void) {
+    static char last[1024] = "?"; static time_t last_mtime;
+    NSMutableArray<NSString *> *try = [NSMutableArray array];
+    const char *env = getenv("DM_CONTROLS"), *root = getenv("DM_ROOT");
+    if (env && *env) [try addObject:@(env)];
+    else {
+        NSString *store = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/nxnative"];
+        if (root && *root) [try addObject:[@(root) stringByAppendingPathComponent:@"controls.tsv"]];
+        [try addObject:[store stringByAppendingPathComponent:@DM_GAME_ID "/controls.tsv"]];   // a build played outside its Mac app (DM_ROOT: the build folder)
+        [try addObject:[store stringByAppendingPathComponent:@"controls.tsv"]];
     }
-    return -1;
+    NSString *path = nil; NSString *text = nil; time_t mt = 0;
+    for (NSString *t in try) { struct stat st; if (stat(t.fileSystemRepresentation, &st)) continue; path = t; mt = st.st_mtime; text = [NSString stringWithContentsOfFile:t encoding:NSUTF8StringEncoding error:nil] ?: @""; break; }
+    const char *now = path ? path.fileSystemRepresentation : "";
+    if (!strcmp(now, last) && mt == last_mtime) return;   // unchanged
+    snprintf(last, sizeof last, "%s", now); last_mtime = mt;
+    keys_release();   // a key held under the old mapping does not stay pressed under the new one
+    if (!path) { dmc_default(&g_ctl); LOG("front end: default controls (no controls file)"); controls_panel_refresh(); return; }
+    char err[300]; int bad = dmc_parse(&g_ctl, text.UTF8String, err, sizeof err);
+    LOG("front end: controls from %s", now);
+    if (bad) LOG("[RED] front end: %d line%s of %s not used, the first %s", bad, bad == 1 ? "" : "s", now, err);
+    controls_panel_refresh();
 }
 // fn held with a letter: the arrow and function keys carry the same modifier flag, so the key must be a letter for this to be a Globe shortcut
 static int fn_shortcut(NSEvent *e) {
@@ -144,15 +172,23 @@ static int fn_shortcut(NSEvent *e) {
 static void on_key(NSEvent *e, int down) {
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
-    switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
-    // An arrow key pressed with Shift held is the right stick until it is released; without Shift, the D-pad. The keyboard had no right stick: a 3D game's camera
-    // could be turned only with a controller (Donkey Kong Bananza)
-    int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
-    if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
-    int b = key_bit(c);
-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
-    g_btn = down ? (g_btn | m) : (g_btn & ~m);
-    if (down && (m || c == 13 || c == 0 || c == 1 || c == 2)) cursor_hide_for_input();   // a key the game takes (WASD: the left stick)
+    if (c >= DMC_KEYS) return;
+    int k;
+    if (down) {
+        k = g_ctl.key[c];
+        // A D-pad key pressed with Shift held is the right stick until it is released; without Shift, the D-pad. The keyboard had no right stick: a 3D game's camera
+        // could be turned only with a controller (Donkey Kong Bananza)
+        if (k >= DMC_LEFT && k <= DMC_DOWN && (e.modifierFlags & NSEventModifierFlagShift))
+            k = k == DMC_LEFT ? DMC_RS_LEFT : k == DMC_UP ? DMC_RS_UP : k == DMC_RIGHT ? DMC_RS_RIGHT : DMC_RS_DOWN;
+        if (k < 0 || g_key_down[c] >= 0) return;
+        g_key_down[c] = (int8_t)k; g_held_ctl[k]++;
+        controls_source(nil);
+        cursor_hide_for_input();   // a key the game takes
+    } else {
+        k = g_key_down[c];
+        if (k < 0) return;
+        g_key_down[c] = -1; if (g_held_ctl[k] > 0) g_held_ctl[k]--;
+    }
     push();
 }
 
@@ -184,6 +220,8 @@ static void pad_read(GCExtendedGamepad *g) {
     K(g.buttonMenu, DM_BTN_PLUS); K(g.buttonOptions, DM_BTN_MINUS); K(g.leftThumbstickButton, DM_BTN_LS); K(g.rightThumbstickButton, DM_BTN_RS);   // nil on pads without them: not pressed
     K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
     #undef K
+    if (m) controls_source(g.controller);
+    m = dmc_pad(&g_ctl, m);   // the controls file's remapping (controls.h)
     pad_set(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
 // Home and Capture: without this macOS takes them as system gestures (Home opens the Games app). Capture has no function in the host, Home quits when it is held (hq_poll).
@@ -275,11 +313,12 @@ static void input_release(void) {
     display_awake(0);
     g_input_on = 0;
     dm_motion_pro_active(0);
-    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+    keys_release();
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     pads_release();
 }
 static void input_resume(void) {
+    controls_load();
     display_awake(1);
     g_input_on = 1;
     dm_motion_pro_active(1);
@@ -290,7 +329,9 @@ static void hidpad_read(hid_pad *d) {
     if (!g_input_on || hq_blocks_input(g_hq.phase)) return;
     int p = g_merge ? 0 : pad_slot_of(&g_slots, d); if (p < 0) return;
     int32_t s[4]; pad_hid_sticks(&d->st, s);
-    pad_set(p, pad_hid_buttons(&d->st), s[0], s[1], s[2], s[3]);
+    uint64_t m = pad_hid_buttons(&d->st);
+    if (m) controls_source(@(d->name));
+    pad_set(p, dmc_pad(&g_ctl, m), s[0], s[1], s[2], s[3]);
 }
 static void hidpad_attach(hid_pad *d) {
     int p = g_merge ? 0 : pad_slot_take(&g_slots, d, d->name); char nb[16];
@@ -1314,6 +1355,132 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+// Frame rate in the title bar: nvn_mtl.m's presented handler counts each frame that reached the screen (front_frame_shown, any thread); a one-second main-queue timer shows the
+// count as "<game> — NN fps". Window › Show Frame Rate in Title turns it on and off; DM_TITLE_FPS=0 starts with it off
+static _Atomic unsigned g_frames_shown;
+void front_frame_shown(void) { g_frames_shown++; }
+static int g_title_fps = 1;
+static void title_fps_tick(void) {
+    unsigned n = atomic_exchange(&g_frames_shown, 0);
+    if (!g_win) return;
+    NSString *t = g_title_fps ? [NSString stringWithFormat:@"%@ — %u fps", @DM_GAME_NAME, n] : @DM_GAME_NAME;
+    if (![g_win.title isEqualToString:t]) g_win.title = t;
+}
+// Controls panel (Window › Show Controls, ⌘/): each Switch control and what gives it on the input used last: the keyboard's keys, or a controller's buttons (their
+// SF Symbols glyph and name as GameController gives them, after pad_apple.h's face mapping and the controls file's remapping). It follows the input as it changes
+static id g_src;   // nil: the keyboard; a GCController; an NSString: a raw HID pad's name
+static NSPanel *g_ctl_panel; static NSGridView *g_ctl_grid; static NSTextField *g_ctl_head;
+static const char *const g_ctl_titles[DMC_COUNT] = {
+    "A", "B", "X", "Y", "Press left stick", "Press right stick", "L", "R", "ZL", "ZR", "+", "−", "D-pad left", "D-pad up", "D-pad right", "D-pad down",
+    "Left stick up", "Left stick down", "Left stick left", "Left stick right", "Right stick up", "Right stick down", "Right stick left", "Right stick right", "Shake",
+};
+static void controls_source(id src) {
+    if (src == g_src || ([src isKindOfClass:NSString.class] && [g_src isEqual:src])) return;
+    g_src = src;
+    if (g_ctl_panel.visible) { if (NSThread.isMainThread) controls_panel_refresh(); else dispatch_async(dispatch_get_main_queue(), ^{ controls_panel_refresh(); }); }
+}
+// The element of a GameController pad that gives Switch button b by default (pad_read's mapping)
+static GCControllerButtonInput *pad_element(GCExtendedGamepad *g, int b) {
+    int lab = dm_pad_labelled(g.controller);
+    switch (b) {
+        case DMC_A: return lab ? g.buttonA : g.buttonB;
+        case DMC_B: return lab ? g.buttonB : g.buttonA;
+        case DMC_X: return lab ? g.buttonX : g.buttonY;
+        case DMC_Y: return lab ? g.buttonY : g.buttonX;
+        case DMC_LSTICK: return g.leftThumbstickButton;
+        case DMC_RSTICK: return g.rightThumbstickButton;
+        case DMC_L: return g.leftShoulder;   case DMC_R: return g.rightShoulder;
+        case DMC_ZL: return g.leftTrigger;   case DMC_ZR: return g.rightTrigger;
+        case DMC_PLUS: return g.buttonMenu;  case DMC_MINUS: return g.buttonOptions;
+        case DMC_LEFT: return g.dpad.left;   case DMC_UP: return g.dpad.up;   case DMC_RIGHT: return g.dpad.right;   case DMC_DOWN: return g.dpad.down;
+    }
+    return nil;
+}
+static NSView *ctl_chip(NSString *symbol, NSString *text) {
+    NSMutableArray<NSView *> *parts = [NSMutableArray array];
+    NSImage *img = symbol.length ? [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:text] : nil;
+    if (img) { NSImageView *iv = [NSImageView imageViewWithImage:img]; iv.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular]; [parts addObject:iv]; }
+    NSTextField *l = [NSTextField labelWithString:text]; l.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; [parts addObject:l];
+    NSStackView *st = [NSStackView stackViewWithViews:parts]; st.spacing = 4;
+    return st;
+}
+static NSView *ctl_cell(NSArray<NSView *> *chips) {
+    if (!chips.count) { NSTextField *l = [NSTextField labelWithString:@"—"]; l.textColor = NSColor.tertiaryLabelColor; return l; }
+    NSStackView *st = [NSStackView stackViewWithViews:chips]; st.spacing = 10; return st;
+}
+static void controls_panel_refresh(void) {
+    if (!g_ctl_panel) return;
+    NSGridView *grid = [NSGridView gridViewWithViews:@[]]; grid.rowSpacing = 5; grid.columnSpacing = 16;   // a new grid: a removed row's views stay in the old one
+    NSStackView *st = (NSStackView *)g_ctl_panel.contentView;
+    if (g_ctl_grid) { [st removeArrangedSubview:g_ctl_grid]; [g_ctl_grid removeFromSuperview]; }
+    [st insertArrangedSubview:grid atIndex:1]; g_ctl_grid = grid;
+    GCExtendedGamepad *g = [g_src isKindOfClass:GCController.class] ? ((GCController *)g_src).extendedGamepad : nil;
+    NSString *head;
+    void (^row)(NSString *, NSArray<NSView *> *) = ^(NSString *name, NSArray<NSView *> *chips) {
+        NSTextField *l = [NSTextField labelWithString:name]; l.textColor = NSColor.secondaryLabelColor;
+        [g_ctl_grid addRowWithViews:@[l, ctl_cell(chips)]];
+    };
+    if (g_src) {
+        head = [NSString stringWithFormat:@"Controller: %@", g ? (((GCController *)g_src).vendorName ?: @"Controller") : g_src];
+        for (int k = 0; k < DMC_BUTTONS; k++) {
+            NSMutableArray<NSView *> *chips = [NSMutableArray array]; uint16_t from = dmc_pad_sources(&g_ctl, k);
+            for (int b = 0; b < DMC_BUTTONS; b++) if (from & (1u << b)) {
+                GCControllerButtonInput *e = g ? pad_element(g, b) : nil;
+                if (g && !e) continue;   // the pad has no such button
+                [chips addObject:ctl_chip(e.sfSymbolsName, e.localizedName ?: @(dmc_names[b]))];
+            }
+            row(@(g_ctl_titles[k]), chips);
+        }
+        row(@"Left stick", @[ctl_chip(g.leftThumbstick.sfSymbolsName ?: @"l.joystick", g.leftThumbstick.localizedName ?: @"Left stick")]);
+        row(@"Right stick", @[ctl_chip(g.rightThumbstick.sfSymbolsName ?: @"r.joystick", g.rightThumbstick.localizedName ?: @"Right stick")]);
+    } else {
+        head = @"Keyboard";
+        for (int k = 0; k < DMC_COUNT; k++) {
+            NSMutableArray<NSView *> *chips = [NSMutableArray array];
+            for (int c = 0; c < DMC_KEYS; c++) if (g_ctl.key[c] == k) { const char *n = dmc_key_name(c); [chips addObject:ctl_chip(nil, n ? @(n) : [NSString stringWithFormat:@"Key %d", c])]; }
+            if (k >= DMC_RS_UP && k <= DMC_RS_RIGHT) {   // Shift + the D-pad's keys
+                int d = k == DMC_RS_UP ? DMC_UP : k == DMC_RS_DOWN ? DMC_DOWN : k == DMC_RS_LEFT ? DMC_LEFT : DMC_RIGHT;
+                for (int c = 0; c < DMC_KEYS; c++) if (g_ctl.key[c] == d) { const char *n = dmc_key_name(c); [chips addObject:ctl_chip(nil, [@"⇧ " stringByAppendingString:@(n ?: "?")])]; }
+            }
+            row(@(g_ctl_titles[k]), chips);
+        }
+    }
+    g_ctl_head.stringValue = head;
+    [g_ctl_panel setContentSize:g_ctl_panel.contentView.fittingSize];
+}
+static void controls_panel_show(void) {
+    if (!g_ctl_panel) {
+        g_ctl_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 360, 600) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
+                                                   backing:NSBackingStoreBuffered defer:YES];
+        g_ctl_panel.title = @"Controls"; g_ctl_panel.becomesKeyOnlyIfNeeded = YES; g_ctl_panel.hidesOnDeactivate = NO; g_ctl_panel.releasedWhenClosed = NO;
+        g_ctl_head = [NSTextField labelWithString:@""]; g_ctl_head.font = [NSFont boldSystemFontOfSize:13];
+        NSTextField *foot = [NSTextField wrappingLabelWithString:@"Follows the input used last. Change them in NX Play: Help › Game Controls, or Edit Controls on a game's page."];
+        foot.font = [NSFont systemFontOfSize:11]; foot.textColor = NSColor.secondaryLabelColor; foot.preferredMaxLayoutWidth = 320;
+        NSStackView *st = [NSStackView stackViewWithViews:@[g_ctl_head, foot]];
+        st.orientation = NSUserInterfaceLayoutOrientationVertical; st.alignment = NSLayoutAttributeLeading; st.spacing = 10; st.edgeInsets = NSEdgeInsetsMake(14, 16, 14, 16);
+        g_ctl_panel.contentView = st;
+        controls_panel_refresh();
+        if (g_win) {   // beside the game window, on the side with room, kept on its screen
+            NSRect gf = g_win.frame, f = g_ctl_panel.frame, vis = (g_win.screen ?: NSScreen.mainScreen).visibleFrame;
+            f.origin.x = NSMaxX(gf) + 8 + f.size.width <= NSMaxX(vis) ? NSMaxX(gf) + 8 : NSMinX(gf) - 8 - f.size.width;
+            f.origin.y = NSMaxY(gf) - f.size.height;
+            f.origin.x = MAX(NSMinX(vis), MIN(f.origin.x, NSMaxX(vis) - f.size.width)); f.origin.y = MAX(NSMinY(vis), MIN(f.origin.y, NSMaxY(vis) - f.size.height));
+            [g_ctl_panel setFrame:f display:NO];
+        }
+    } else controls_panel_refresh();
+    [g_ctl_panel orderFront:nil];
+}
+@interface DmFrontActions : NSObject <NSMenuItemValidation>
+@end
+@implementation DmFrontActions
+- (void)showControls:(id)sender { (void)sender; if (g_ctl_panel.visible) [g_ctl_panel orderOut:nil]; else controls_panel_show(); }
+- (void)toggleTitleFps:(id)sender { (void)sender; g_title_fps = !g_title_fps; atomic_store(&g_frames_shown, 0); title_fps_tick(); }
+- (BOOL)validateMenuItem:(NSMenuItem *)m {
+    if (m.action == @selector(toggleTitleFps:)) m.state = g_title_fps ? NSControlStateValueOn : NSControlStateValueOff;
+    if (m.action == @selector(showControls:)) m.title = g_ctl_panel.visible ? @"Hide Controls" : @"Show Controls";
+    return YES;
+}
+@end
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1369,6 +1536,14 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        static DmFrontActions *acts; acts = [DmFrontActions new];
+        [wm addItem:NSMenuItem.separatorItem];
+        [wm addItemWithTitle:@"Show Controls" action:@selector(showControls:) keyEquivalent:@"/"].target = acts;
+        [wm addItemWithTitle:@"Show Frame Rate in Title" action:@selector(toggleTitleFps:) keyEquivalent:@""].target = acts;
+        { const char *tf = getenv("DM_TITLE_FPS"); g_title_fps = !(tf && !strcmp(tf, "0")); }
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { (void)t; title_fps_tick(); }];
+        controls_load();
+        if (getenv("DM_CONTROLS_WINDOW") && atoi(getenv("DM_CONTROLS_WINDOW"))) dispatch_async(dispatch_get_main_queue(), ^{ controls_panel_show(); });
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
@@ -1483,7 +1658,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     dispatch_sync(dispatch_get_main_queue(), ^{
         // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+        keys_release();
         dm_touch_set(NULL, 0);
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];

@@ -27,6 +27,9 @@ void front_screen_match(int fps);
 // lays the picture out in that shape instead of 16:9, so a profile with screen_aspect under DM_SCREEN_ASPECT (1920x1344) fills a 1.43:1 screen and touches map onto the picture
 // as drawn. Before the first call the picture is 16:9. Called from the present thread; the front end switches to its main thread and does not block
 void front_picture_shape(int w, int h);
+// A frame reached the screen (nvn_mtl.m present: the drawable's presented handler, with a presentation time): the Mac front end counts them and shows the frame rate in the
+// window title (front_mac.m). Any thread; must not block. A weak no-op elsewhere (iOS, unit tests)
+void front_frame_shown(void);
 // Progress screen of the first-start prepare step (nvn_mtl.m warm_prepare: "Preparing shaders" while the pipelines of the prewarm lists are built before the game's first frame):
 // title and done of total shown over the game's view (a dark screen, the title, a bar and a count), updated on each call; title NULL hides it. Any thread; the front end switches to its main
 // thread and does not block. Nothing is shown without a window

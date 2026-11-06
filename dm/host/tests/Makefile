@@ -59,6 +59,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_pad_apple
 	$(B)/t_home_quit
 	$(B)/t_home_quit_mac
+	$(B)/t_controls
 	$(B)/t_motion_pro
 	$(B)/t_motion_pro_mac
 	TMPDIR="$(abspath $(B))" $(B)/t_hid
@@ -213,7 +214,9 @@ $(B)/t_motion_apple: t_motion_apple.m ../motion_apple.h ../dm_input.h | $(B)
 run: $(B)/t_pad_apple
 $(B)/t_pad_apple: t_pad_apple.m ../pad_apple.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -I.. -o $@ t_pad_apple.m -framework Foundation -framework GameController
-run: $(B)/t_home_quit $(B)/t_home_quit_mac
+run: $(B)/t_home_quit $(B)/t_home_quit_mac $(B)/t_controls
+$(B)/t_controls: t_controls.c ../controls.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_controls.c
 $(B)/t_home_quit: t_home_quit.c ../home_quit.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_home_quit.c
 $(B)/t_home_quit_mac: t_home_quit_mac.m ../home_quit_mac.h | $(B)

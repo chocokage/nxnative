@@ -7815,6 +7815,7 @@ int mtl_warm_wait(int timeout_ms) {
 // pressure on iOS), which is when it is needed. DM_PSO_PREPARE=0: the prewarm runs in the background as before (as it does without a window); DM_PSO_PREPARE_THREADS=<n> sets the workers
 void front_progress(const char *title, long done, long total);
 __attribute__((weak)) void front_progress(const char *title, long done, long total) { (void)title; (void)done; (void)total; }   // the front ends' (front.h); none in the unit tests
+__attribute__((weak)) void front_frame_shown(void) {}   // the Mac front end counts them for the window title's frame rate (front.h); none on iOS or in the unit tests
 static int prepare_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_PSO_PREPARE");
@@ -13690,6 +13691,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
+        if (tt > 0) front_frame_shown();
     }];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
     if (target_ts > 0) [dr present];
