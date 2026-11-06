@@ -142,6 +142,7 @@ static void host_preload(int argc, char **argv) {
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
+    { void dm_session_start(int argc, char **argv); dm_session_start(argc, argv); }   // DM_RECORD: this run as a session to play again; sets DM_REC before the keys start (hle_session.c)
     hid_keys_init();   // DM_KEYS scripted input
     uint64_t tb = now_ns();
     stubs_report();

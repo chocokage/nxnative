@@ -538,6 +538,20 @@ To replay a run deterministically, record and replay with the same build, the sa
 
 Limits: the replay matches the recording read for read only while the game's reads fall in the same frames in both runs; a game that reads input on a thread racing the present, or that runs differently despite `DM_DETCLOCK`, can still drift. Input that changes between two reads of one frame is recorded as that frame's state (above), so a read early in the frame can see in the replay what only a later read saw live. The touchscreen is sampled at player 1's controller reads. Players 2 to 8, a second finger and a controller's live motion are not recorded (`DM_KEYS` has no syntax for them).
 
+### Recording and replaying a session (`DM_RECORD`)
+
+`DM_RECORD=<folder>` records every run as a session that can be played again, without the player copying anything first (`hle_session.c`). Each run gets `<folder>/<YYYYMMDD-HHMMSS>/` with:
+
+- `input.keys`: player 1's input, as `DM_REC` writes it (above). A `DM_REC` the player set wins, and the session then has no input.
+- `save/` (and `save_device/` for a game that also mounts a device save of its own, `hle_fs.c` `h_fs_MountDeviceSave`): the committed save at its mount, before the game reads it, cloned on APFS (copied elsewhere). A game that saves on its own (an autosave), and a run that crashed after a save, start the next session from that save: each session starts where its own run started, so there is no position to find in a longer recording.
+- `meta.tsv`: `key<TAB>value` lines: `title`, `build` (main's build ID), `started`, `cwd`, one `arg` per host argument, one `env` per `DM_*` variable (a Mac app's settings reach the host as these), and at a clean exit `frames` and `ended`. A session without `ended` is a crash or a kill.
+
+`DM_RECORD_KEEP` sessions (10 by default) are kept; the oldest go at the next start. NX Play's `nxplay` sets `DM_RECORD` to `<title ID>_build/recordings` for every play (`NXPLAY_RECORD=0` turns it off).
+
+`scripts/replay.py <session or recordings folder>` plays a session again: the same host, arguments and settings, on a fresh copy of the session's save in `<session>/replay/` (the session stays as it was), with `DM_KEYS=@input.keys`, `DM_SAVE_SYNC=0` (the cloud's save would replace the session's), and no recording. Given the recordings folder, it plays the newest session. `--list` lists the sessions, `--until <frame>` stops the input at that presented frame, `--no-input` only starts from the session's save, and `-e KEY=VALUE` adds a setting. The keyboard and controllers keep working during a replay (their input is ORed with the script's): press anything to take over.
+
+Sessions record with the real clock (product runs do not set `DM_DETCLOCK`, which changes how the game runs), so a replay is approximate: frames are presents, and a load that takes a different number of frames than it did in the recording moves the input after it. Menus and short routes usually replay; long play through several loads can drift. For an exact replay, record a run with `DM_DETCLOCK` and replay it with the same step (above).
+
 ### GPU measurement
 
 The benchmark gives each frame's GPU time; these switches split it by pass, on the Mac or on an iPhone (`Documents/env.txt`), and are off by default: `DM_NVN_GPUPROF=every:<n>` (each encoder's GPU time and attachment traffic in one frame of every n), `DM_NVN_PASSDUMP=every:<n>`, `DM_AB=<frames>` (switches set to `ab` alternate in phases of one run) and `DM_GPU_CAPTURE` (Metal GPU traces for Xcode, written to `DM_GPU_CAPTURE_DIR`, by default `gpu_captures/` in the working directory, which keeps the newest `DM_GPU_CAPTURE_KEEP`; an IPA built with `DM_METAL_CAPTURE=1`, or `MTL_CAPTURE_ENABLED=1` on the Mac). `dm/tools/gpuprof.py` reads their log lines. How to use them: [05, GPU time on the device](agents/05-debugging.md#gpu-time-on-the-device).

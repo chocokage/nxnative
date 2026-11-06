@@ -17,3 +17,5 @@ int dm_game_imports(const char *prefix) { (void)prefix; return 0; }
 int dm_mii_standin(const char *dir) { (void)dir; return 0; }
 // the guest scheduler (hle_thread.c): no guest threads, so no handoff to leave
 void dm_thread_service_request(void) {}
+// DM_RECORD's copy of the mounted save (hle_session.c): no session in a unit test
+void dm_session_save(const char *dir) { (void)dir; }
